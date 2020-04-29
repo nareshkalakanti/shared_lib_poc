@@ -1,11 +1,3 @@
-import groovy.transform.Field
-import hudson.FilePath
-import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
-
-@Library('Shared_Libary') _
-
-env.MAVEN = "mvn --batch-mode"
-
 pipeline {
     agent none
 
@@ -14,102 +6,93 @@ pipeline {
     }
 
     stages {
-        stage('Checkout'){
-            steps{
-                doCheckout()
-                stash includes: '**', name: 'project'
+        
+        stage('Checkout') {
+            steps {
+                checkout(
+                    [$class: 'GitSCM',
+                     branches: [[name: '*/master']],
+                     doGenerateSubmoduleConfigurations: false,
+                     extensions: [],
+                     submoduleCfg: [],
+                     userRemoteConfigs: [[credentialsId: '',
+                   url: '']
+                ]])
             }
         }
-        stage('Static Analysis') {
+        stage('Build') {
             steps {
-                doStaticAnalysis()
+                sh '''
+                mvn clean –U install -Dmaven.test.skip=true
+                '''
             }
         }
-        stage('Unit Tests') {
+        stage('Tests') {
             steps {
-                doUnitTests()
+                sh '''
+                  mvn clean –U test
+                '''
             }
         }
-        stage('Integration Tests') {
+        stage('SonarQube') {
             steps {
-                doIntegrationTests()
+               when {
+                // Currently Sonar is not run for pull requests
+                expression { env.CHANGE_ID == null }
+            }
+            environment {
+                SONAR_TOKEN = credentials('sonarqube-token')
+            }
+            steps {
+                withMaven(maven: 'maven-latest', jdk: 'jdk8-latest', globalMavenSettingsConfig: 'default-global-settings', mavenSettingsConfig: 'codice-maven-settings', mavenOpts: '${LARGE_MVN_OPTS} ${LINUX_MVN_RANDOM}') {
+                 //Todo: sonarqube properies file
+                 sh ''' 
+                     mvn clean –U org.jacoco:jacoco-maven-plugin:0.7.4.201502262128:prepare-agent install
+                     org.jacoco:jacoco-maven-plugin:0.7.4.201502262128:report
+                     org.jacoco:jacoco-maven-plugin:0.7.4.201502262128:merge
+                     -Djacoco.destFile=${WORKSPACE}/target-jacoco/merged.exec
+                     -Dmaven.test.failure.ignore=true -Djacoco.append=true
+                 '''
+                }
+            }        
             }
         }
-        stage('Acceptance Tests') {
-            agent {
-                label 'docker-in-docker'
-            }
-
+        stage('Archive') {
             steps {
-                unstash 'project'
-                doAcceptanceTests()
-                stash includes: "target/**", name: 'acceptance-tests', allowEmpty: true
-            }
-        }
-        stage('Test Coverage') {
-            steps {
-                unstash 'acceptance-tests'
-                doTestCoverage()                
-            }
-        }
-        stage('Build Report') {
-            steps {
-                echo 'Building test reports...'
-                doBuildReport(env.WORKSPACE)
-                publishSnapshotsTests()
                 script {
-                    env.generateReportOnFailure = false
+                    step([$class     : 'Artifact',
+                          projectName: 'Test-BUILD',
+                          filter     : "**/*",
+                          target     : '.']);
                 }
             }
         }
-        stage('Sonar') {
+           stage('Publish') {
             steps {
-                doSonar()
+                echo 'Build the artifacts..'
+                //Todo: artifactory configuration  not clear so adding a script after build
+                sh '''
+                mvn clean -U install --P jboss-7.1 -Dmaven.test.skip=true
+                '''
+                echo 'Publish the artifacts..'
+                    script
+                        {
+                        def server = Artifactory.newServer('http://localhost:8081/artifactory', 'admin', 'test@123')
+                        def server = Artifactory.server 'Artifac_dev_server1'
+                        server.bypassProxy = true
+                        server.upload(uploadSpec)
+                        echo 'Uploaded the file to Jfrog Artifactory successfully'
+                        }
             }
         }
-        stage('Release to Artifactory') {
-            when {
-			    expression { "${env.BRANCH_NAME}" == 'master' }
+         stage('Notify') {
+            steps {
+                echo 'Mail Notification...'
+                mail body: 'Project build successful for job named testpipeline',
+                from: 'test1@gmail.com',
+                subject: 'project build successful',
+                to: 'test2@gmail.com'
             }
-			steps {
-				publishReleaseTests()
-                doReleaseToArtifactory()
-                script{
-                    env.buildType = "release"
-                }                                
-			}
-			post {
-				failure {
-					script {
-						doArtifactoryRollback()
-					}
-				}
-			}
         }
-   }
-   post {
-       failure {
-           script{           
-                utils.sendEmail()
-                doBuildReportPostAction(env.WORKSPACE)
-                publishSnapshotsTests()
-                currentBuild.result = "FAILURE"
-                publishMetrics(testCount)
-            }               
-       }
-
-       success {
-           script{
-                currentBuild.result = "SUCCESS"
-                publishMetrics(testCount)
-           }
-       }
-
-       always{
-           script{
-                testCount = getTestCount()
-           }
-           deleteOldBuilds(5)
-       }
    }
 } 
